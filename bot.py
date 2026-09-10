@@ -1,255 +1,356 @@
 import os
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
 
-# =========================
+# =========================================================
 # SETTINGS
-# =========================
+# =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = os.environ.get("ADMIN_ID")
 
 CHANNEL_USERNAME = "@YOUR_CHANNEL"
+CHANNEL_URL = "https://t.me/YOUR_CHANNEL"
+SUPPORT_USERNAME = "@YOUR_ADMIN_USERNAME"
 
 DB_FILE = "bot.db"
 
-# =========================
-# DATABASE
-# =========================
 
-def db():
-    return sqlite3.connect(DB_FILE)
+# =========================================================
+# CHECK ENVIRONMENT VARIABLES
+# =========================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing!")
+
+if not ADMIN_ID:
+    raise RuntimeError("ADMIN_ID environment variable is missing!")
+
+
+# =========================================================
+# DATABASE
+# =========================================================
 
 def init_db():
-    con = db()
-    cur = con.cursor()
+    conn = sqlite3.connect(DB_FILE)
 
-    cur.execute("""
+    cursor = conn.cursor()
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
+            first_name TEXT,
             balance REAL DEFAULT 0,
-            referred_by INTEGER
+            referrals INTEGER DEFAULT 0,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount REAL,
-            method TEXT,
-            number TEXT,
-            status TEXT DEFAULT 'pending'
-        )
-    """)
-
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
 
-def add_user(user_id, username, referred_by=None):
-    con = db()
-    cur = con.cursor()
+def add_user(user):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
 
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    exists = cur.fetchone()
+    cursor.execute("""
+        INSERT OR IGNORE INTO users
+        (user_id, username, first_name)
+        VALUES (?, ?, ?)
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or ""
+    ))
 
-    if not exists:
-        cur.execute(
-            "INSERT INTO users (user_id, username, referred_by) VALUES (?, ?, ?)",
-            (user_id, username, referred_by)
-        )
-
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
 
 def get_balance(user_id):
-    con = db()
-    cur = con.cursor()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
 
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+    cursor.execute(
+        "SELECT balance FROM users WHERE user_id = ?",
+        (user_id,)
+    )
 
-    con.close()
+    result = cursor.fetchone()
 
-    return row[0] if row else 0
+    conn.close()
+
+    if result:
+        return result[0]
+
+    return 0
 
 
-# =========================
+# =========================================================
 # START
-# =========================
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
-    referred_by = None
-
-    # Referral link:
-    # /start 123456789
-    if context.args:
-        try:
-            referred_by = int(context.args[0])
-
-            if referred_by == user.id:
-                referred_by = None
-
-        except ValueError:
-            referred_by = None
-
-    add_user(
-        user.id,
-        user.username or "",
-        referred_by
-    )
+    add_user(user)
 
     keyboard = [
         [
-            InlineKeyboardButton("💰 আজকের Task", callback_data="task"),
-            InlineKeyboardButton("💵 Balance", callback_data="balance")
+            InlineKeyboardButton(
+                "💰 আজকের Task",
+                callback_data="task"
+            )
         ],
         [
-            InlineKeyboardButton("👥 Referral", callback_data="referral"),
-            InlineKeyboardButton("💳 Withdraw", callback_data="withdraw")
+            InlineKeyboardButton(
+                "👥 Referral",
+                callback_data="referral"
+            ),
+            InlineKeyboardButton(
+                "💵 Balance",
+                callback_data="balance"
+            )
         ],
         [
-            InlineKeyboardButton("📞 Support", callback_data="support"),
-            InlineKeyboardButton("📢 Channel", url="https://t.me/YOUR_CHANNEL")
+            InlineKeyboardButton(
+                "💳 Withdraw",
+                callback_data="withdraw"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 আমাদের Channel",
+                url=CHANNEL_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📞 Support",
+                url=f"https://t.me/{SUPPORT_USERNAME.replace('@', '')}"
+            )
         ]
     ]
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    text = f"""
+🤖 *Income Taka — Online Earning*
+
+আসসালামু আলাইকুম, {user.first_name}! 👋
+
+💰 এখানে বিভিন্ন বৈধ Task ও Earning Opportunity সম্পর্কে জানতে পারবেন।
+
+🎁 Daily Task
+👥 Referral
+💵 Balance
+💳 Withdraw
+
+⚠️ কোনো OTP, Password বা ব্যক্তিগত গোপন তথ্য কাউকে দেবেন না।
+
+নিচের Menu থেকে একটি অপশন নির্বাচন করুন 👇
+"""
+
     await update.message.reply_text(
-        f"🤖 <b>Income Taka — Online Earning</b>\n\n"
-        f"আসসালামু আলাইকুম, {user.first_name}! 👋\n\n"
-        f"💰 এখানে বিভিন্ন বৈধ Task ও Reward ব্যবস্থার মাধ্যমে কাজ করা যাবে।\n\n"
-        f"⚠️ কোনো OTP, Password বা ব্যক্তিগত গোপন তথ্য কাউকে দেবেন না।",
-        parse_mode="HTML",
+        text,
+        parse_mode="Markdown",
         reply_markup=reply_markup
     )
 
 
-# =========================
+# =========================================================
 # TASK
-# =========================
+# =========================================================
 
 async def task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    add_user(update.effective_user)
+
+    text = """
+💰 *আজকের Task*
+
+আজকের Task এখনো যোগ করা হয়নি।
+
+📌 Admin নতুন Task যোগ করলে এখানে দেখানো হবে।
+
+⚠️ কোনো Task-এর জন্য আগে টাকা পাঠানোর প্রয়োজন হলে সতর্ক থাকুন।
+"""
+
     await update.message.reply_text(
-        "💰 <b>আজকের Task</b>\n\n"
-        "📌 বর্তমানে কোনো Task যোগ করা হয়নি।\n\n"
-        "নতুন Task যোগ হলে এখানে দেখা যাবে।",
-        parse_mode="HTML"
+        text,
+        parse_mode="Markdown"
     )
 
 
-# =========================
-# BALANCE
-# =========================
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user_id = update.effective_user.id
-    amount = get_balance(user_id)
-
-    await update.message.reply_text(
-        f"💵 <b>আপনার Balance</b>\n\n"
-        f"💰 বর্তমান Balance: ৳{amount:.2f}",
-        parse_mode="HTML"
-    )
-
-
-# =========================
+# =========================================================
 # REFERRAL
-# =========================
+# =========================================================
 
 async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    user_id = update.effective_user.id
+    user = update.effective_user
+
+    add_user(user)
+
     bot_username = context.bot.username
 
-    link = f"https://t.me/{bot_username}?start={user_id}"
+    referral_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
+
+    text = f"""
+👥 *আপনার Referral*
+
+আপনার Referral Link:
+
+`{referral_link}`
+
+বন্ধুদের এই লিংকটি শেয়ার করতে পারেন।
+
+🎁 Referral Reward-এর নিয়ম Admin ঘোষণা করবে।
+"""
 
     await update.message.reply_text(
-        "👥 <b>Your Referral Link</b>\n\n"
-        f"🔗 {link}\n\n"
-        "বন্ধুদের এই লিংক শেয়ার করতে পারেন।\n"
-        "Referral reward থাকলে তা আপনার Balance-এ যোগ হবে।",
-        parse_mode="HTML"
+        text,
+        parse_mode="Markdown"
     )
 
 
-# =========================
+# =========================================================
+# BALANCE
+# =========================================================
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    add_user(user)
+
+    user_balance = get_balance(user.id)
+
+    text = f"""
+💵 *আপনার Balance*
+
+বর্তমান Balance:
+💰 *৳{user_balance:.2f}*
+
+আরও বৈধ Task সম্পন্ন করে আয় করতে পারেন।
+"""
+
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown"
+    )
+
+
+# =========================================================
 # WITHDRAW
-# =========================
+# =========================================================
 
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    text = """
+💳 *Withdraw*
+
+টাকা তোলার নিয়ম:
+
+1️⃣ আপনার Balance দেখুন
+2️⃣ Withdraw-এর ন্যূনতম সীমা পূরণ করুন
+3️⃣ Admin-এর নির্দেশনা অনুসরণ করুন
+
+📞 Withdraw সংক্রান্ত সাহায্যের জন্য Support-এ যোগাযোগ করুন।
+
+⚠️ Withdraw করার জন্য কাউকে OTP বা Password দেবেন না।
+"""
+
     await update.message.reply_text(
-        "💳 <b>Withdraw</b>\n\n"
-        "টাকা উত্তোলনের জন্য Support-এ যোগাযোগ করুন।\n\n"
-        "📞 /support",
-        parse_mode="HTML"
+        text,
+        parse_mode="Markdown"
     )
 
 
-# =========================
+# =========================================================
 # HELP
-# =========================
+# =========================================================
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    text = """
+📖 *Help*
+
+/start - 🚀 Bot চালু করুন
+/task - 💰 আজকের Task দেখুন
+/referral - 👥 Referral Link দেখুন
+/balance - 💵 আপনার Balance দেখুন
+/withdraw - 💳 টাকা তোলার নিয়ম
+/help - 📖 সাহায্য
+/support - 📞 Support
+/channel - 📢 আমাদের Channel
+
+যেকোনো সমস্যা হলে Support-এ যোগাযোগ করুন।
+"""
+
     await update.message.reply_text(
-        "📖 <b>Help</b>\n\n"
-        "/start - 🚀 Bot চালু করুন\n"
-        "/task - 💰 Task দেখুন\n"
-        "/referral - 👥 Referral Link\n"
-        "/balance - 💵 Balance দেখুন\n"
-        "/withdraw - 💳 Withdraw\n"
-        "/support - 📞 Support\n"
-        "/channel - 📢 Channel",
-        parse_mode="HTML"
+        text,
+        parse_mode="Markdown"
     )
 
 
-# =========================
+# =========================================================
 # SUPPORT
-# =========================
+# =========================================================
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    text = f"""
+📞 *Support*
+
+সাহায্যের জন্য আমাদের Admin-এর সাথে যোগাযোগ করুন:
+
+{SUPPORT_USERNAME}
+
+⚠️ আপনার Bot Token, OTP বা Password কাউকে দেবেন না।
+"""
+
     await update.message.reply_text(
-        "📞 <b>Support</b>\n\n"
-        "কোনো সমস্যা হলে Admin-এর সাথে যোগাযোগ করুন।\n\n"
-        "👉 @YOUR_ADMIN_USERNAME",
-        parse_mode="HTML"
+        text,
+        parse_mode="Markdown"
     )
 
 
-# =========================
+# =========================================================
 # CHANNEL
-# =========================
+# =========================================================
 
 async def channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📢 Channel Join করুন",
+                url=CHANNEL_URL
+            )
+        ]
+    ]
+
     await update.message.reply_text(
-        "📢 আমাদের Telegram Channel:\n\n"
-        "👉 https://t.me/YOUR_CHANNEL"
+        "📢 আমাদের Channel:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-# =========================
-# BUTTONS
-# =========================
+# =========================================================
+# BUTTON HANDLER
+# =========================================================
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -257,75 +358,157 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
+    user = query.from_user
+
+    add_user(user)
+
     if query.data == "task":
 
         await query.message.reply_text(
-            "💰 আজকের Task\n\n"
-            "বর্তমানে কোনো Task নেই।"
-        )
-
-    elif query.data == "balance":
-
-        amount = get_balance(query.from_user.id)
-
-        await query.message.reply_text(
-            f"💵 আপনার Balance: ৳{amount:.2f}"
+            "💰 আজকের Task এখনো যোগ করা হয়নি।"
         )
 
     elif query.data == "referral":
 
         bot_username = context.bot.username
 
-        link = f"https://t.me/{bot_username}?start={query.from_user.id}"
+        referral_link = (
+            f"https://t.me/{bot_username}?start=ref_{user.id}"
+        )
 
         await query.message.reply_text(
-            f"👥 আপনার Referral Link:\n\n{link}"
+            f"👥 আপনার Referral Link:\n\n{referral_link}"
+        )
+
+    elif query.data == "balance":
+
+        user_balance = get_balance(user.id)
+
+        await query.message.reply_text(
+            f"💵 আপনার Balance: ৳{user_balance:.2f}"
         )
 
     elif query.data == "withdraw":
 
         await query.message.reply_text(
-            "💳 Withdraw করার জন্য /withdraw লিখুন।"
-        )
-
-    elif query.data == "support":
-
-        await query.message.reply_text(
-            "📞 Support: @YOUR_ADMIN_USERNAME"
+            "💳 Withdraw-এর নিয়ম জানতে /withdraw ব্যবহার করুন।"
         )
 
 
-# =========================
+# =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-type",
+            "text/plain"
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            b"Income Taka Bot is running!"
+        )
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+
+    port = int(
+        os.environ.get("PORT", "10000")
+    )
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    print(f"Health server running on port {port}")
+
+    server.serve_forever()
+
+
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
 
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN is not set!")
-        return
+    print("Starting Income Taka Bot...")
 
     init_db()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Start Render HTTP server
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True
+    )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("task", task))
-    application.add_handler(CommandHandler("referral", referral))
-    application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("withdraw", withdraw))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("support", support))
-    application.add_handler(CommandHandler("channel", channel))
+    health_thread.start()
+
+    # Create Telegram application
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # Commands
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("task", task)
+    )
+
+    application.add_handler(
+        CommandHandler("referral", referral)
+    )
+
+    application.add_handler(
+        CommandHandler("balance", balance)
+    )
+
+    application.add_handler(
+        CommandHandler("withdraw", withdraw)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("support", support)
+    )
+
+    application.add_handler(
+        CommandHandler("channel", channel)
+    )
+
+    # Buttons
+    from telegram.ext import CallbackQueryHandler
 
     application.add_handler(
         CallbackQueryHandler(button_handler)
     )
 
-    print("Bot is running...")
+    print("Bot is running!")
 
     application.run_polling()
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
