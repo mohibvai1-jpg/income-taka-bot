@@ -128,7 +128,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📢 Channel", url=CHANNEL_URL)],
         [InlineKeyboardButton("📞 Support", url="https://t.me/" + SUPPORT_USERNAME.lstrip("@"))]
     ]
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"🤖 *Income Taka — Online Earning*\n\n"
         f"আসসালামু আলাইকুম, {update.effective_user.first_name}! 👋\n\n"
         "বৈধ ও স্বচ্ছ Task সম্পন্ন করে Reward পাওয়ার ব্যবস্থা এখানে থাকবে।\n"
@@ -143,13 +143,13 @@ async def tasks(update, context):
     rows = con.execute("SELECT id,title,description,reward,link FROM tasks WHERE active=1 ORDER BY id DESC").fetchall()
     con.close()
     if not rows:
-        await update.message.reply_text("📭 এখন কোনো active Task নেই।")
+        await update.effective_message.reply_text("📭 এখন কোনো active Task নেই।")
         return
     for tid, title, desc, reward, link in rows:
         kb = [[InlineKeyboardButton(f"✅ Complete Task #{tid}", callback_data=f"do:{tid}")]]
         if link:
             kb.insert(0, [InlineKeyboardButton("🔗 Open Task", url=link)])
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"💰 *{title}*\n\n{desc}\n\n🎁 Reward: ৳{reward:.2f}",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -163,7 +163,7 @@ async def referral(update, context):
     row = con.execute("SELECT referrals FROM users WHERE user_id=?", (update.effective_user.id,)).fetchone()
     con.close()
     count = row[0] if row else 0
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"👥 *Referral*\n\nআপনার লিংক:\n`{link}`\n\n"
         f"👤 Referrals: {count}\n\n"
         "Referral reward Admin-এর নির্ধারিত নিয়ম অনুযায়ী দেওয়া হবে।",
@@ -173,7 +173,7 @@ async def referral(update, context):
 
 async def show_balance(update, context):
     add_user(update.effective_user)
-    await update.message.reply_text(f"💵 আপনার Balance: ৳{balance(update.effective_user.id):.2f}")
+    await update.effective_message.reply_text(f"💵 আপনার Balance: ৳{balance(update.effective_user.id):.2f}")
 
 
 async def do_task(update, context):
