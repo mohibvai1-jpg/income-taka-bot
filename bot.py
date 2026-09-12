@@ -1,582 +1,1443 @@
-import os
+ import os
 import sqlite3
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, ConversationHandler, MessageHandler, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
+# এগুলো পরে নিজের তথ্য দিয়ে পরিবর্তন করবেন
 CHANNEL_URL = "https://t.me/YOUR_CHANNEL"
 SUPPORT_USERNAME = "@YOUR_ADMIN_USERNAME"
+
 DB_FILE = "bot.db"
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not ADMIN_ID:
-    raise RuntimeError("ADMIN_ID is missing")
 
-ADD_TITLE, ADD_DESC, ADD_REWARD, ADD_LINK = range(4)
-WITHDRAW_AMOUNT, WITHDRAW_METHOD, WITHDRAW_ACCOUNT = range(10, 13)
-SUBMIT_PROOF = 20
-
-
-def db():
-    return sqlite3.connect(DB_FILE)
-
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        username TEXT, first_name TEXT,
-        balance REAL DEFAULT 0,
-        referrals INTEGER DEFAULT 0,
-        referred_by INTEGER,
-        joined_at TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS tasks(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        description TEXT NOT NULL,
-        reward REAL NOT NULL,
-        link TEXT,
-        active INTEGER DEFAULT 1,
-        created_at TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS submissions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER, user_id INTEGER,
-        proof TEXT, status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        UNIQUE(task_id, user_id)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS withdrawals(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, amount REAL,
-        method TEXT, account TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT
-    )""")
-    con.commit()
-    con.close()
-
-
-def add_user(user, referrer_id=None):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,))
-    exists = cur.fetchone()
-    if not exists:
-        valid_ref = None
-        if referrer_id and referrer_id != user.id:
-            cur.execute("SELECT user_id FROM users WHERE user_id=?", (referrer_id,))
-            if cur.fetchone():
-                valid_ref = referrer_id
-        cur.execute("""INSERT INTO users
-            (user_id, username, first_name, referred_by, joined_at)
-            VALUES (?, ?, ?, ?, ?)""",
-            (user.id, user.username or "", user.first_name or "",
-             valid_ref, datetime.utcnow().isoformat()))
-        if valid_ref:
-            cur.execute("UPDATE users SET referrals=referrals+1 WHERE user_id=?", (valid_ref,))
-    else:
-        cur.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?",
-                    (user.username or "", user.first_name or "", user.id))
-    con.commit()
-    con.close()
-
-
-def balance(user_id):
-    con = db()
-    row = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
-    con.close()
-    return float(row[0]) if row else 0.0
-
-
-def change_balance(user_id, amount):
-    con = db()
-    con.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
-    con.commit()
-    con.close()
-
-
-def is_admin(update):
-    return update.effective_user and update.effective_user.id == ADMIN_ID
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ref = None
-    if context.args and context.args[0].startswith("ref_"):
-        try:
-            ref = int(context.args[0][4:])
-        except ValueError:
-            pass
-    add_user(update.effective_user, ref)
-    kb = [
-        [InlineKeyboardButton("💰 Tasks", callback_data="tasks"),
-         InlineKeyboardButton("💵 Balance", callback_data="balance")],
-        [InlineKeyboardButton("👥 Referral", callback_data="referral"),
-         InlineKeyboardButton("💳 Withdraw", callback_data="withdraw")],
-        [InlineKeyboardButton("📢 Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton("📞 Support", url="https://t.me/" + SUPPORT_USERNAME.lstrip("@"))]
-    ]
-    await update.effective_message.reply_text(
-        f"🤖 *Income Taka — Online Earning*\n\n"
-        f"আসসালামু আলাইকুম, {update.effective_user.first_name}! 👋\n\n"
-        "বৈধ ও স্বচ্ছ Task সম্পন্ন করে Reward পাওয়ার ব্যবস্থা এখানে থাকবে।\n"
-        "⚠️ OTP, Password বা কোনো গোপন তথ্য দেবেন না।",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-
-async def tasks(update, context):
-    add_user(update.effective_user)
-    con = db()
-    rows = con.execute("SELECT id,title,description,reward,link FROM tasks WHERE active=1 ORDER BY id DESC").fetchall()
-    con.close()
-    if not rows:
-        await update.effective_message.reply_text("📭 এখন কোনো active Task নেই।")
-        return
-    for tid, title, desc, reward, link in rows:
-        kb = [[InlineKeyboardButton(f"✅ Complete Task #{tid}", callback_data=f"do:{tid}")]]
-        if link:
-            kb.insert(0, [InlineKeyboardButton("🔗 Open Task", url=link)])
-        await update.effective_message.reply_text(
-            f"💰 *{title}*\n\n{desc}\n\n🎁 Reward: ৳{reward:.2f}",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
-        )
-
-
-async def referral(update, context):
-    add_user(update.effective_user)
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{update.effective_user.id}"
-    con = db()
-    row = con.execute("SELECT referrals FROM users WHERE user_id=?", (update.effective_user.id,)).fetchone()
-    con.close()
-    count = row[0] if row else 0
-    await update.effective_message.reply_text(
-        f"👥 *Referral*\n\nআপনার লিংক:\n`{link}`\n\n"
-        f"👤 Referrals: {count}\n\n"
-        "Referral reward Admin-এর নির্ধারিত নিয়ম অনুযায়ী দেওয়া হবে।",
-        parse_mode="Markdown"
-    )
-
-
-async def show_balance(update, context):
-    add_user(update.effective_user)
-    await update.effective_message.reply_text(f"💵 আপনার Balance: ৳{balance(update.effective_user.id):.2f}")
-
-
-async def do_task(update, context):
-    q = update.callback_query
-    await q.answer()
-    tid = int(q.data.split(":")[1])
-    con = db()
-    task = con.execute("SELECT title,reward FROM tasks WHERE id=? AND active=1", (tid,)).fetchone()
-    old = con.execute("SELECT id FROM submissions WHERE task_id=? AND user_id=?",
-                      (tid, q.from_user.id)).fetchone()
-    con.close()
-    if not task:
-        await q.message.reply_text("❌ Task পাওয়া যায়নি।")
-        return
-    if old:
-        await q.message.reply_text("⏳ আপনি এই Task-এর proof আগে জমা দিয়েছেন।")
-        return
-    context.user_data["submit_task_id"] = tid
-    await q.message.reply_text(
-        f"📝 *{task[0]}*\n\nTask সম্পন্ন করার পর আপনার proof/link এখানে পাঠান।\n"
-        "Admin যাচাই করার পর reward যোগ হবে।",
-        parse_mode="Markdown"
-    )
-
-
-async def submit_proof(update, context):
-    tid = context.user_data.pop("submit_task_id", None)
-    if not tid:
-        return
-    proof = update.message.text.strip()
-    if len(proof) < 3:
-        await update.message.reply_text("❌ Valid proof দিন।")
-        return
-    con = db()
-    task = con.execute("SELECT title,reward FROM tasks WHERE id=? AND active=1", (tid,)).fetchone()
-    try:
-        con.execute("""INSERT INTO submissions(task_id,user_id,proof,created_at)
-                       VALUES(?,?,?,?,?)""",
-                    (tid, update.effective_user.id, proof, datetime.utcnow().isoformat()))
-    except sqlite3.IntegrityError:
-        con.close()
-        await update.message.reply_text("⏳ Proof আগে জমা হয়েছে।")
-        return
-    con.commit()
-    con.close()
-    await update.message.reply_text("✅ Proof জমা হয়েছে। Admin যাচাই করবেন।")
-    await context.bot.send_message(
-        ADMIN_ID,
-        f"📥 *New Task Proof*\nTask: #{tid} — {task[0]}\n"
-        f"User: {update.effective_user.id} (@{update.effective_user.username or 'no_username'})\n"
-        f"Reward: ৳{task[1]:.2f}\nProof: {proof}\n\n"
-        f"Approve: /approve {tid} {update.effective_user.id}\n"
-        f"Reject: /reject {tid} {update.effective_user.id}",
-        parse_mode="Markdown"
-    )
-
-
-async def withdraw(update, context):
-    add_user(update.effective_user)
-    if balance(update.effective_user.id) <= 0:
-        await update.message.reply_text("💳 আপনার Balance 0। আগে বৈধ Task সম্পন্ন করুন।")
-        return WITHDRAW_AMOUNT
-    context.user_data["withdraw_step"] = True
-    await update.message.reply_text(
-        f"💳 আপনার Balance: ৳{balance(update.effective_user.id):.2f}\n\n"
-        "কত টাকা Withdraw করতে চান? শুধু সংখ্যা লিখুন।"
-    )
-    return WITHDRAW_AMOUNT
-
-
-async def withdraw_amount(update, context):
-    try:
-        amount = float(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ শুধু টাকার পরিমাণ লিখুন।")
-        return WITHDRAW_AMOUNT
-    if amount <= 0 or amount > balance(update.effective_user.id):
-        await update.message.reply_text("❌ Balance-এর মধ্যে একটি সঠিক পরিমাণ দিন।")
-        return WITHDRAW_AMOUNT
-    context.user_data["wd_amount"] = amount
-    await update.message.reply_text("💳 Payment method লিখুন (যেমন bKash/Nagad)।")
-    return WITHDRAW_METHOD
-
-
-async def withdraw_method(update, context):
-    context.user_data["wd_method"] = update.message.text.strip()
-    await update.message.reply_text("📱 আপনার payment number/account দিন।")
-    return WITHDRAW_ACCOUNT
-
-
-async def withdraw_account(update, context):
-    user = update.effective_user
-    amount = context.user_data["wd_amount"]
-    method = context.user_data["wd_method"]
-    account = update.message.text.strip()
-    con = db()
-    con.execute("""INSERT INTO withdrawals(user_id,amount,method,account,created_at)
-                   VALUES(?,?,?,?,?)""",
-                (user.id, amount, method, account, datetime.utcnow().isoformat()))
-    con.commit()
-    con.close()
-    context.user_data.clear()
-    await update.message.reply_text("✅ Withdraw request জমা হয়েছে। Admin যাচাই করবেন।")
-    await context.bot.send_message(
-        ADMIN_ID,
-        f"💳 *New Withdraw*\nID: see /withdrawals\nUser: {user.id}\n"
-        f"Amount: ৳{amount:.2f}\nMethod: {method}\nAccount: {account}",
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
-
-
-async def cancel(update, context):
-    context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.")
-    return ConversationHandler.END
-
-
-# ---------------- ADMIN ----------------
-
-async def admin(update, context):
-    if not is_admin(update):
-        return
-    await update.message.reply_text(
-        "🛠 *Admin Panel*\n\n"
-        "/addtask — নতুন Task\n"
-        "/tasks_admin — সব Task\n"
-        "/submissions — pending proofs\n"
-        "/approve TASK_ID USER_ID\n"
-        "/reject TASK_ID USER_ID\n"
-        "/users — user count\n"
-        "/addbalance USER_ID AMOUNT\n"
-        "/withdrawals — pending withdrawals\n"
-        "/pay WD_ID — mark paid\n"
-        "/rejectwd WD_ID — reject withdrawal",
-        parse_mode="Markdown"
-    )
-
-
-async def addtask_start(update, context):
-    if not is_admin(update):
-        return ConversationHandler.END
-    await update.message.reply_text("Task-এর title লিখুন:")
-    return ADD_TITLE
-
-
-async def addtask_title(update, context):
-    context.user_data["t_title"] = update.message.text.strip()
-    await update.message.reply_text("Task-এর বিস্তারিত description লিখুন:")
-    return ADD_DESC
-
-
-async def addtask_desc(update, context):
-    context.user_data["t_desc"] = update.message.text.strip()
-    await update.message.reply_text("Reward কত? যেমন 5 বা 10")
-    return ADD_REWARD
-
-
-async def addtask_reward(update, context):
-    try:
-        r = float(update.message.text.strip())
-        if r <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ সঠিক সংখ্যা দিন।")
-        return ADD_REWARD
-    context.user_data["t_reward"] = r
-    await update.message.reply_text("Task link দিন। Link না থাকলে `-` লিখুন।")
-    return ADD_LINK
-
-
-async def addtask_link(update, context):
-    link = update.message.text.strip()
-    if link == "-":
-        link = ""
-    con = db()
-    con.execute("""INSERT INTO tasks(title,description,reward,link,created_at)
-                   VALUES(?,?,?,?,?)""",
-                (context.user_data["t_title"], context.user_data["t_desc"],
-                 context.user_data["t_reward"], link, datetime.utcnow().isoformat()))
-    con.commit()
-    con.close()
-    context.user_data.clear()
-    await update.message.reply_text("✅ Task তৈরি হয়েছে। /tasks দিয়ে দেখা যাবে।")
-    return ConversationHandler.END
-
-
-async def tasks_admin(update, context):
-    if not is_admin(update):
-        return
-    con = db()
-    rows = con.execute("SELECT id,title,reward,active FROM tasks ORDER BY id DESC").fetchall()
-    con.close()
-    if not rows:
-        await update.message.reply_text("কোনো Task নেই।")
-        return
-    text = "\n".join([f"#{r[0]} — {r[1]} — ৳{r[2]:.2f} — {'ON' if r[3] else 'OFF'}" for r in rows])
-    await update.message.reply_text(text)
-
-
-async def submissions(update, context):
-    if not is_admin(update):
-        return
-    con = db()
-    rows = con.execute("""SELECT s.id,s.task_id,s.user_id,s.proof,t.reward
-                         FROM submissions s JOIN tasks t ON t.id=s.task_id
-                         WHERE s.status='pending' ORDER BY s.id DESC""").fetchall()
-    con.close()
-    if not rows:
-        await update.message.reply_text("📭 Pending proof নেই।")
-        return
-    for sid, tid, uid, proof, reward in rows:
-        await update.message.reply_text(
-            f"📥 Submission #{sid}\nTask #{tid}\nUser: {uid}\nReward: ৳{reward:.2f}\nProof: {proof}\n\n"
-            f"/approve {tid} {uid}\n/reject {tid} {uid}"
-        )
-
-
-async def approve(update, context):
-    if not is_admin(update) or len(context.args) != 2:
-        return
-    tid, uid = map(int, context.args)
-    con = db()
-    row = con.execute("""SELECT s.id,t.reward FROM submissions s JOIN tasks t ON t.id=s.task_id
-                         WHERE s.task_id=? AND s.user_id=? AND s.status='pending'""", (tid, uid)).fetchone()
-    if not row:
-        con.close()
-        await update.message.reply_text("❌ Pending submission পাওয়া যায়নি।")
-        return
-    sid, reward = row
-    con.execute("UPDATE submissions SET status='approved' WHERE id=?", (sid,))
-    con.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (reward, uid))
-    con.commit()
-    con.close()
-    await update.message.reply_text(f"✅ Approved. User {uid} পেল ৳{reward:.2f}")
-    await context.bot.send_message(uid, f"🎉 আপনার Task approved!\n💰 Reward: ৳{reward:.2f}")
-
-
-async def reject(update, context):
-    if not is_admin(update) or len(context.args) != 2:
-        return
-    tid, uid = map(int, context.args)
-    con = db()
-    cur = con.execute("""UPDATE submissions SET status='rejected'
-                        WHERE task_id=? AND user_id=? AND status='pending'""", (tid, uid))
-    con.commit()
-    con.close()
-    await update.message.reply_text("❌ Submission rejected." if cur.rowcount else "Submission পাওয়া যায়নি।")
-    if cur.rowcount:
-        await context.bot.send_message(uid, f"❌ আপনার Task #{tid} proof reject হয়েছে।")
-
-
-async def users(update, context):
-    if not is_admin(update):
-        return
-    con = db()
-    count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    total = con.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
-    con.close()
-    await update.message.reply_text(f"👥 Users: {count}\n💰 Total balance: ৳{total:.2f}")
-
-
-async def addbalance(update, context):
-    if not is_admin(update) or len(context.args) != 2:
-        return
-    uid, amount = int(context.args[0]), float(context.args[1])
-    change_balance(uid, amount)
-    await update.message.reply_text(f"✅ User {uid} balance changed by ৳{amount:.2f}")
-
-
-async def withdrawals(update, context):
-    if not is_admin(update):
-        return
-    con = db()
-    rows = con.execute("""SELECT id,user_id,amount,method,account,status
-                         FROM withdrawals WHERE status='pending' ORDER BY id DESC""").fetchall()
-    con.close()
-    if not rows:
-        await update.message.reply_text("📭 Pending withdrawal নেই।")
-        return
-    for r in rows:
-        await update.message.reply_text(
-            f"💳 Withdrawal #{r[0]}\nUser: {r[1]}\nAmount: ৳{r[2]:.2f}\n"
-            f"Method: {r[3]}\nAccount: {r[4]}\n\n"
-            f"/pay {r[0]}\n/rejectwd {r[0]}"
-        )
-
-
-async def pay(update, context):
-    if not is_admin(update) or len(context.args) != 1:
-        return
-    wid = int(context.args[0])
-    con = db()
-    row = con.execute("SELECT user_id,amount FROM withdrawals WHERE id=? AND status='pending'", (wid,)).fetchone()
-    if not row:
-        con.close()
-        await update.message.reply_text("❌ Withdrawal পাওয়া যায়নি।")
-        return
-    uid, amount = row
-    if balance(uid) < amount:
-        con.close()
-        await update.message.reply_text("❌ User balance এখন যথেষ্ট নয়।")
-        return
-    con.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, uid))
-    con.execute("UPDATE withdrawals SET status='paid' WHERE id=?", (wid,))
-    con.commit()
-    con.close()
-    await update.message.reply_text(f"✅ Withdrawal #{wid} marked as PAID.")
-    await context.bot.send_message(uid, f"✅ আপনার ৳{amount:.2f} Withdraw request paid হয়েছে।")
-
-
-async def rejectwd(update, context):
-    if not is_admin(update) or len(context.args) != 1:
-        return
-    wid = int(context.args[0])
-    con = db()
-    cur = con.execute("UPDATE withdrawals SET status='rejected' WHERE id=? AND status='pending'", (wid,))
-    con.commit()
-    con.close()
-    await update.message.reply_text("❌ Withdrawal rejected." if cur.rowcount else "Withdrawal পাওয়া যায়নি।")
-
-
-async def button(update, context):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "tasks":
-        await tasks(update, context)
-    elif q.data == "balance":
-        await show_balance(update, context)
-    elif q.data == "referral":
-        await referral(update, context)
-    elif q.data == "withdraw":
-        await q.message.reply_text("💳 টাকা তুলতে /withdraw লিখুন।")
-    elif q.data.startswith("do:"):
-        await do_task(update, context)
-
+# =========================================================
+# HEALTH SERVER FOR RENDER
+# =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Income Taka Bot is running!")
+
     def log_message(self, format, *args):
+        return
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance REAL DEFAULT 0,
+            referred_by INTEGER DEFAULT NULL,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            reward REAL DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER,
+            user_id INTEGER,
+            proof TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            number TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# USER FUNCTIONS
+# =========================================================
+
+def add_user(user, referred_by=None):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user.id,)
+    )
+
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute("""
+            INSERT INTO users
+            (user_id, username, first_name, balance, referred_by, created_at)
+            VALUES (?, ?, ?, 0, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            referred_by,
+            datetime.now().isoformat()
+        ))
+
+        conn.commit()
+
+    conn.close()
+
+
+def get_balance(user_id):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT balance FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+
+    row = cur.fetchone()
+    conn.close()
+
+    if row:
+        return float(row["balance"])
+
+    return 0.0
+
+
+def change_balance(user_id, amount):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+        SET balance = balance + ?
+        WHERE user_id = ?
+    """, (amount, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    referred_by = None
+
+    # Referral link: /start 123456
+    if context.args:
+        try:
+            referred_by = int(context.args[0])
+
+            if referred_by == user.id:
+                referred_by = None
+
+        except ValueError:
+            referred_by = None
+
+    add_user(user, referred_by)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "💰 আজকের Task",
+                callback_data="tasks"
+            ),
+            InlineKeyboardButton(
+                "💵 Balance",
+                callback_data="balance"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Referral",
+                callback_data="referral"
+            ),
+            InlineKeyboardButton(
+                "💳 Withdraw",
+                callback_data="withdraw"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📖 Help",
+                callback_data="help"
+            ),
+            InlineKeyboardButton(
+                "📞 Support",
+                callback_data="support"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 Channel",
+                url=CHANNEL_URL
+            )
+        ]
+    ]
+
+    text = (
+        "🤖 <b>Income Taka — Online Earning</b>\n\n"
+        f"👋 আসসালামু আলাইকুম {user.first_name}!\n\n"
+        "📱 বিভিন্ন Task সম্পন্ন করে Earning করতে পারবেন।\n"
+        "🎁 Daily Task\n"
+        "👥 Referral\n"
+        "💰 Balance\n"
+        "💳 Withdrawal\n\n"
+        "⚠️ কোনো OTP বা Password কারো সাথে শেয়ার করবেন না।"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# TASK LIST
+# =========================================================
+
+async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM tasks
+        ORDER BY id DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.reply_text(
+            "📭 বর্তমানে কোনো Task নেই।\n\n"
+            "পরে আবার চেষ্টা করুন।"
+        )
+        return
+
+    keyboard = []
+
+    for row in rows:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💰 {row['title']} — ৳{row['reward']}",
+                callback_data=f"do:{row['id']}"
+            )
+        ])
+
+    await message.reply_text(
+        "💰 <b>Available Tasks</b>\n\n"
+        "নিচের Task থেকে একটি নির্বাচন করুন:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# TASK DETAIL + PROOF
+# =========================================================
+
+SUBMIT_PROOF = 1
+
+
+async def do_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+
+    await q.answer()
+
+    try:
+        task_id = int(q.data.split(":")[1])
+    except Exception:
+        await q.message.reply_text("❌ Task ID সঠিক নয়।")
+        return ConversationHandler.END
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (task_id,)
+    )
+
+    task = cur.fetchone()
+    conn.close()
+
+    if not task:
+        await q.message.reply_text(
+            "❌ এই Task আর পাওয়া যাচ্ছে না।"
+        )
+        return ConversationHandler.END
+
+    context.user_data["task_id"] = task_id
+
+    text = (
+        f"📌 <b>{task['title']}</b>\n\n"
+        f"📝 <b>Task:</b>\n{task['description']}\n\n"
+        f"💰 <b>Reward:</b> ৳{task['reward']}\n\n"
+        "✅ Task সম্পন্ন করার পর Screenshot/Proof-এর তথ্য "
+        "এই চ্যাটে পাঠান।\n\n"
+        "❌ বাতিল করতে /cancel লিখুন।"
+    )
+
+    await q.message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+    return SUBMIT_PROOF
+
+
+async def submit_proof(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+    proof = update.effective_message.text
+
+    task_id = context.user_data.get("task_id")
+
+    if not task_id:
+        await update.effective_message.reply_text(
+            "❌ Task পাওয়া যায়নি। আবার /task দিয়ে চেষ্টা করুন।"
+        )
+        return ConversationHandler.END
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (task_id,)
+    )
+
+    task = cur.fetchone()
+
+    if not task:
+        conn.close()
+
+        await update.effective_message.reply_text(
+            "❌ এই Task আর পাওয়া যাচ্ছে না।"
+        )
+
+        return ConversationHandler.END
+
+    # Same user + same task pending submission check
+    cur.execute("""
+        SELECT id FROM submissions
+        WHERE task_id = ?
+        AND user_id = ?
+        AND status = 'pending'
+    """, (task_id, user.id))
+
+    existing = cur.fetchone()
+
+    if existing:
+        conn.close()
+
+        await update.effective_message.reply_text(
+            "⏳ আপনার এই Task-এর Proof ইতোমধ্যে জমা আছে।\n"
+            "Admin review করার জন্য অপেক্ষা করুন।"
+        )
+
+        return ConversationHandler.END
+
+    # এখানে 4টি placeholder
+    cur.execute("""
+        INSERT INTO submissions
+        (task_id, user_id, proof, status)
+        VALUES (?, ?, ?, 'pending')
+    """, (
+        task_id,
+        user.id,
+        proof
+    ))
+
+    conn.commit()
+    submission_id = cur.lastrowid
+    conn.close()
+
+    await update.effective_message.reply_text(
+        "✅ <b>Proof সফলভাবে জমা হয়েছে!</b>\n\n"
+        f"🆔 Submission ID: {submission_id}\n"
+        "⏳ Admin আপনার Proof যাচাই করবেন।\n"
+        "Approved হলে Reward Balance-এ যোগ হবে।",
+        parse_mode="HTML"
+    )
+
+    # Notify admin
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🔔 <b>New Task Submission</b>\n\n"
+                    f"👤 User ID: {user.id}\n"
+                    f"👤 Username: @{user.username or 'N/A'}\n"
+                    f"📌 Task ID: {task_id}\n"
+                    f"🆔 Submission ID: {submission_id}\n\n"
+                    f"📄 Proof:\n{proof}"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    context.user_data.pop("task_id", None)
+
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("task_id", None)
+
+    await update.effective_message.reply_text(
+        "❌ কাজ বাতিল করা হয়েছে।"
+    )
+
+    return ConversationHandler.END
+
+
+# =========================================================
+# BALANCE
+# =========================================================
+
+async def show_balance(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+    balance_amount = get_balance(user.id)
+
+    await update.effective_message.reply_text(
+        "💵 <b>Your Balance</b>\n\n"
+        f"💰 Balance: ৳{balance_amount:.2f}",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# REFERRAL
+# =========================================================
+
+async def referral(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    bot = await context.bot.get_me()
+
+    referral_link = (
+        f"https://t.me/{bot.username}?start={user.id}"
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT COUNT(*) AS total FROM users WHERE referred_by = ?",
+        (user.id,)
+    )
+
+    row = cur.fetchone()
+    conn.close()
+
+    total_referrals = row["total"] if row else 0
+
+    text = (
+        "👥 <b>Referral System</b>\n\n"
+        f"🔗 আপনার Referral Link:\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"👤 Total Referral: {total_referrals}\n\n"
+        "বন্ধুদের এই Link দিয়ে Bot-এ Join করাতে পারেন।"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# WITHDRAW
+# =========================================================
+
+WITHDRAW_AMOUNT = 1
+WITHDRAW_METHOD = 2
+WITHDRAW_NUMBER = 3
+
+
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    balance_amount = get_balance(user.id)
+
+    if balance_amount <= 0:
+        await update.effective_message.reply_text(
+            "💳 আপনার Balance বর্তমানে ৳0.00\n\n"
+            "আগে Task সম্পন্ন করে Balance তৈরি করুন।"
+        )
+        return ConversationHandler.END
+
+    await update.effective_message.reply_text(
+        "💳 <b>Withdrawal</b>\n\n"
+        f"💰 আপনার Balance: ৳{balance_amount:.2f}\n\n"
+        "আপনি কত টাকা Withdraw করতে চান?\n"
+        "শুধু Amount লিখুন।\n\n"
+        "উদাহরণ: <code>100</code>\n\n"
+        "❌ বাতিল করতে /cancel লিখুন।",
+        parse_mode="HTML"
+    )
+
+    return WITHDRAW_AMOUNT
+
+
+async def withdrawal_amount(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        amount = float(update.effective_message.text)
+
+        if amount <= 0:
+            raise ValueError
+
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ সঠিক Amount লিখুন।\n"
+            "উদাহরণ: 100"
+        )
+        return WITHDRAW_AMOUNT
+
+    user = update.effective_user
+    balance_amount = get_balance(user.id)
+
+    if amount > balance_amount:
+        await update.effective_message.reply_text(
+            f"❌ আপনার Balance ৳{balance_amount:.2f}।\n"
+            "এর চেয়ে বেশি Withdraw করা যাবে না।"
+        )
+        return WITHDRAW_AMOUNT
+
+    context.user_data["withdraw_amount"] = amount
+
+    await update.effective_message.reply_text(
+        "💳 Payment Method লিখুন:\n\n"
+        "উদাহরণ:\n"
+        "bKash\n"
+        "Nagad\n"
+        "Rocket"
+    )
+
+    return WITHDRAW_METHOD
+
+
+async def withdrawal_method(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    method = update.effective_message.text.strip()
+
+    if not method:
+        await update.effective_message.reply_text(
+            "❌ Payment Method লিখুন।"
+        )
+        return WITHDRAW_METHOD
+
+    context.user_data["withdraw_method"] = method
+
+    await update.effective_message.reply_text(
+        "📱 আপনার bKash/Nagad/Rocket Number লিখুন:"
+    )
+
+    return WITHDRAW_NUMBER
+
+
+async def withdrawal_number(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    number = update.effective_message.text.strip()
+    amount = context.user_data.get("withdraw_amount")
+    method = context.user_data.get("withdraw_method")
+
+    if not number:
+        await update.effective_message.reply_text(
+            "❌ সঠিক Number লিখুন।"
+        )
+        return WITHDRAW_NUMBER
+
+    if not amount or not method:
+        await update.effective_message.reply_text(
+            "❌ Withdrawal তথ্য পাওয়া যায়নি। আবার চেষ্টা করুন।"
+        )
+        return ConversationHandler.END
+
+    balance_amount = get_balance(user.id)
+
+    if amount > balance_amount:
+        await update.effective_message.reply_text(
+            "❌ পর্যাপ্ত Balance নেই।"
+        )
+        return ConversationHandler.END
+
+    # Reserve amount
+    change_balance(user.id, -amount)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO withdrawals
+        (user_id, amount, method, number, status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+    """, (
+        user.id,
+        amount,
+        method,
+        number,
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    withdrawal_id = cur.lastrowid
+    conn.close()
+
+    await update.effective_message.reply_text(
+        "✅ <b>Withdrawal Request জমা হয়েছে!</b>\n\n"
+        f"🆔 Request ID: {withdrawal_id}\n"
+        f"💰 Amount: ৳{amount:.2f}\n"
+        f"💳 Method: {method}\n"
+        f"📱 Number: {number}\n\n"
+        "⏳ Admin যাচাই করার পর Payment করা হবে।",
+        parse_mode="HTML"
+    )
+
+    # Notify admin
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "💳 <b>New Withdrawal Request</b>\n\n"
+                    f"🆔 Request ID: {withdrawal_id}\n"
+                    f"👤 User ID: {user.id}\n"
+                    f"👤 Username: @{user.username or 'N/A'}\n"
+                    f"💰 Amount: ৳{amount:.2f}\n"
+                    f"💳 Method: {method}\n"
+                    f"📱 Number: {number}"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    context.user_data.pop("withdraw_amount", None)
+    context.user_data.pop("withdraw_method", None)
+
+    return ConversationHandler.END
+
+
+# =========================================================
+# HELP
+# =========================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    await update.effective_message.reply_text(
+        "📖 <b>Help</b>\n\n"
+        "/start — Bot চালু করুন\n"
+        "/task — Task দেখুন\n"
+        "/referral — Referral Link\n"
+        "/balance — Balance দেখুন\n"
+        "/withdraw — টাকা Withdraw\n"
+        "/support — Support\n"
+        "/channel — Channel\n"
+        "/help — Help\n\n"
+        "⚠️ কখনো OTP বা Password শেয়ার করবেন না।",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# SUPPORT
+# =========================================================
+
+async def support_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    await update.effective_message.reply_text(
+        "📞 <b>Support</b>\n\n"
+        f"প্রয়োজনে যোগাযোগ করুন: {SUPPORT_USERNAME}",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# CHANNEL
+# =========================================================
+
+async def channel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📢 আমাদের Channel",
+                url=CHANNEL_URL
+            )
+        ]
+    ]
+
+    await update.effective_message.reply_text(
+        "📢 আমাদের Official Channel:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# ADMIN - ADD TASK
+# =========================================================
+
+async def admin_addtask(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "❌ আপনি Admin নন।"
+        )
+        return
+
+    if len(context.args) < 3:
+        await update.effective_message.reply_text(
+            "❌ Format:\n\n"
+            "/addtask Title | Description | Reward\n\n"
+            "উদাহরণ:\n"
+            "/addtask YouTube Task | ভিডিও দেখুন | 10"
+        )
+        return
+
+    raw = " ".join(context.args)
+    parts = [x.strip() for x in raw.split("|")]
+
+    if len(parts) < 3:
+        await update.effective_message.reply_text(
+            "❌ | দিয়ে ৩টি অংশ দিন:\n"
+            "Title | Description | Reward"
+        )
+        return
+
+    title = parts[0]
+    description = parts[1]
+
+    try:
+        reward = float(parts[2])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ Reward সংখ্যা হতে হবে।"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO tasks
+        (title, description, reward, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        title,
+        description,
+        reward,
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    task_id = cur.lastrowid
+    conn.close()
+
+    await update.effective_message.reply_text(
+        "✅ Task Added!\n\n"
+        f"🆔 ID: {task_id}\n"
+        f"📌 Title: {title}\n"
+        f"💰 Reward: ৳{reward}"
+    )
+
+
+# =========================================================
+# ADMIN - TASK LIST
+# =========================================================
+
+async def admin_tasks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "❌ আপনি Admin নন।"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM tasks ORDER BY id DESC"
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "📭 কোনো Task নেই।"
+        )
+        return
+
+    text = "📋 <b>All Tasks</b>\n\n"
+
+    for row in rows:
+        text += (
+            f"🆔 {row['id']}\n"
+            f"📌 {row['title']}\n"
+            f"💰 ৳{row['reward']}\n\n"
+        )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# ADMIN - SUBMISSIONS
+# =========================================================
+
+async def admin_submissions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "❌ আপনি Admin নন।"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM submissions
+        WHERE status = 'pending'
+        ORDER BY id DESC
+        LIMIT 10
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "📭 কোনো Pending Submission নেই।"
+        )
+        return
+
+    text = "📥 <b>Pending Submissions</b>\n\n"
+
+    for row in rows:
+        text += (
+            f"🆔 Submission: {row['id']}\n"
+            f"👤 User: {row['user_id']}\n"
+            f"📌 Task: {row['task_id']}\n"
+            f"📄 Proof: {row['proof']}\n"
+            "━━━━━━━━━━━━\n"
+        )
+
+    text += (
+        "\nApprove করতে:\n"
+        "<code>/approve SUBMISSION_ID</code>\n\n"
+        "Reject করতে:\n"
+        "<code>/reject SUBMISSION_ID</code>"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# ADMIN - APPROVE SUBMISSION
+# =========================================================
+
+async def admin_approve(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "❌ আপনি Admin নন।"
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "❌ ব্যবহার করুন:\n"
+            "/approve SUBMISSION_ID"
+        )
+        return
+
+    try:
+        submission_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ সঠিক Submission ID দিন।"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT submissions.*, tasks.reward
+        FROM submissions
+        JOIN tasks ON tasks.id = submissions.task_id
+        WHERE submissions.id = ?
+    """, (submission_id,))
+
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+
+        await update.effective_message.reply_text(
+            "❌ Submission পাওয়া যায়নি।"
+        )
+        return
+
+    if row["status"] != "pending":
+        conn.close()
+
+        await update.effective_message.reply_text(
+            "⚠️ এই Submission ইতোমধ্যে process করা হয়েছে।"
+        )
+        return
+
+    reward = float(row["reward"])
+
+    cur.execute("""
+        UPDATE submissions
+        SET status = 'approved'
+        WHERE id = ?
+    """, (submission_id,))
+
+    cur.execute("""
+        UPDATE users
+        SET balance = balance + ?
+        WHERE user_id = ?
+    """, (
+        reward,
+        row["user_id"]
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await update.effective_message.reply_text(
+        "✅ Submission Approved!\n\n"
+        f"🆔 Submission: {submission_id}\n"
+        f"💰 Reward: ৳{reward:.2f}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=row["user_id"],
+            text=(
+                "🎉 <b>Task Approved!</b>\n\n"
+                f"💰 আপনার Balance-এ ৳{reward:.2f} যোগ হয়েছে।\n"
+                f"💵 Current Balance: ৳{get_balance(row['user_id']):.2f}"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception:
         pass
 
 
-def health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+# =========================================================
+# ADMIN - REJECT SUBMISSION
+# =========================================================
 
+async def admin_reject(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "❌ আপনি Admin নন।"
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "❌ ব্যবহার করুন:\n"
+            "/reject SUBMISSION_ID"
+        )
+        return
+
+    try:
+        submission_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ সঠিক Submission ID দিন।"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM submissions WHERE id = ?",
+        (submission_id,)
+    )
+
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+
+        await update.effective_message.reply_text(
+            "❌ Submission পাওয়া যায়নি।"
+        )
+        return
+
+    if row["status"] != "pending":
+        conn.close()
+
+        await update.effective_message.reply_text(
+            "⚠️ এই Submission ইতোমধ্যে process করা হয়েছে।"
+        )
+        return
+
+    cur.execute("""
+        UPDATE submissions
+        SET status = 'rejected'
+        WHERE id = ?
+    """, (submission_id,))
+
+    conn.commit()
+    conn.close()
+
+    await update.effective_message.reply_text(
+        f"❌ Submission {submission_id} rejected."
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=row["user_id"],
+            text=(
+                "❌ আপনার Task Proof Reject করা হয়েছে।\n\n"
+                "সঠিকভাবে Task সম্পন্ন করে আবার চেষ্টা করতে পারেন।"
+            )
+        )
+    except Exception:
+        pass
+
+
+# =========================================================
+# ADMIN - WITHDRAWALS
+# =========================================================
+
+async def admin_withdrawals(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "❌ আপনি Admin নন।"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM withdrawals
+        WHERE status = 'pending'
+        ORDER BY id DESC
+        LIMIT 10
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "📭 কোনো Pending Withdrawal নেই।"
+        )
+        return
+
+    text = "💳 <b>Pending Withdrawals</b>\n\n"
+
+    for row in rows:
+        text += (
+            f"🆔 ID: {row['id']}\n"
+            f"👤 User: {row['user_id']}\n"
+            f"💰 Amount: ৳{row['amount']}\n"
+            f"💳 Method: {row['method']}\n"
+            f"📱 Number: {row['number']}\n"
+            "━━━━━━━━━━━━\n"
+        )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# CALLBACK BUTTON
+# =========================================================
+
+async def button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    q = update.callback_query
+
+    # এখানে শুধু সাধারণ button callback handle হবে
+    # do: callback ConversationHandler handle করবে
+
+    if q.data == "tasks":
+        await q.answer()
+        await tasks(update, context)
+
+    elif q.data == "balance":
+        await q.answer()
+        await show_balance(update, context)
+
+    elif q.data == "referral":
+        await q.answer()
+        await referral(update, context)
+
+    elif q.data == "withdraw":
+        await q.answer()
+        await q.message.reply_text(
+            "💳 টাকা তুলতে /withdraw লিখুন।"
+        )
+
+    elif q.data == "help":
+        await q.answer()
+        await help_command(update, context)
+
+    elif q.data == "support":
+        await q.answer()
+        await support_command(update, context)
+
+
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    print(
+        "ERROR:",
+        repr(context.error)
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable পাওয়া যায়নি!"
+        )
+
     init_db()
-    threading.Thread(target=health_server, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("task", tasks))
-    app.add_handler(CommandHandler("tasks", tasks))
-    app.add_handler(CommandHandler("referral", referral))
-    app.add_handler(CommandHandler("balance", show_balance))
-    app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CommandHandler("tasks_admin", tasks_admin))
-    app.add_handler(CommandHandler("submissions", submissions))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CommandHandler("reject", reject))
-    app.add_handler(CommandHandler("users", users))
-    app.add_handler(CommandHandler("addbalance", addbalance))
-    app.add_handler(CommandHandler("withdrawals", withdrawals))
-    app.add_handler(CommandHandler("pay", pay))
-    app.add_handler(CommandHandler("rejectwd", rejectwd))
-    app.add_handler(CallbackQueryHandler(button))
+    # Render health server
+    threading.Thread(
+        target=run_health_server,
+        daemon=True
+    ).start()
 
-    add_conv = ConversationHandler(
-        entry_points=[CommandHandler("addtask", addtask_start)],
-        states={
-            ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addtask_title)],
-            ADD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, addtask_desc)],
-            ADD_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, addtask_reward)],
-            ADD_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, addtask_link)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
     )
-    wd_conv = ConversationHandler(
-        entry_points=[CommandHandler("withdraw", withdraw)],
-        states={
-            WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
-            WITHDRAW_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_method)],
-            WITHDRAW_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_account)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+
+    # -----------------------------------------------------
+    # TASK PROOF CONVERSATION
+    # -----------------------------------------------------
+
     proof_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(do_task, pattern=r"^do:\d+$")],
-        states={SUBMIT_PROOF: [MessageHandler(filters.TEXT & ~filters.COMMAND, submit_proof)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        entry_points=[
+            CallbackQueryHandler(
+                do_task,
+                pattern=r"^do:\d+$"
+            )
+        ],
+        states={
+            SUBMIT_PROOF: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    submit_proof
+                )
+            ]
+        },
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel
+            )
+        ],
+        per_user=True,
+        per_chat=True,
+        per_message=False,
     )
 
-    app.add_handler(add_conv)
-    app.add_handler(wd_conv)
-    app.add_handler(proof_conv)
-    app.run_polling()
+    # -----------------------------------------------------
+    # WITHDRAW CONVERSATION
+    # -----------------------------------------------------
 
+    wd_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler(
+                "withdraw",
+                withdraw
+            )
+        ],
+        states={
+            WITHDRAW_AMOUNT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    withdrawal_amount
+                )
+            ],
+            WITHDRAW_METHOD: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    withdrawal_method
+                )
+            ],
+            WITHDRAW_NUMBER: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    withdrawal_number
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel
+            )
+        ],
+        per_user=True,
+        per_chat=True,
+        per_message=False,
+    )
+
+    # -----------------------------------------------------
+    # COMMANDS
+    # -----------------------------------------------------
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("task", tasks)
+    )
+
+    app.add_handler(
+        CommandHandler("referral", referral)
+    )
+
+    app.add_handler(
+        CommandHandler("balance", show_balance)
+    )
+
+    app.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    app.add_handler(
+        CommandHandler("support", support_command)
+    )
+
+    app.add_handler(
+        CommandHandler("channel", channel_command)
+    )
+
+    # -----------------------------------------------------
+    # CONVERSATIONS FIRST
+    # -----------------------------------------------------
+
+    # খুব গুরুত্বপূর্ণ:
+    # proof_conv এবং wd_conv generic button-এর আগে থাকবে।
+
+    app.add_handler(proof_conv)
+
+    app.add_handler(wd_conv)
+
+    # -----------------------------------------------------
+    # ADMIN COMMANDS
+    # -----------------------------------------------------
+
+    app.add_handler(
+        CommandHandler(
+            "addtask",
+            admin_addtask
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "admintasks",
+            admin_tasks
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "submissions",
+            admin_submissions
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "approve",
+            admin_approve
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "reject",
+            admin_reject
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "withdrawals",
+            admin_withdrawals
+        )
+    )
+
+    # -----------------------------------------------------
+    # GENERAL CALLBACK BUTTON
+    # -----------------------------------------------------
+
+    # do: callback এখানে আসবে না,
+    # কারণ proof_conv আগে do: ধরে ফেলবে।
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button,
+            pattern=r"^(tasks|balance|referral|withdraw|help|support)$"
+        )
+    )
+
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    print("🤖 Income Taka Bot is starting...")
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+# =========================================================
+# START PROGRAM
+# =========================================================
 
 if __name__ == "__main__":
     main()
