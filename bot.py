@@ -193,15 +193,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Referral link: /start 123456
     if context.args:
         try:
-            referred_by = int(context.args[0])
+            REFERRER_BONUS = 5.0
+NEW_USER_BONUS = 2.0
 
-            if referred_by == user.id:
-                referred_by = None
 
-        except ValueError:
+def add_user(user, referred_by=None):
+    conn = get_db()
+    cur = conn.cursor()
+
+    # User আগে থেকেই আছে কি না
+    cur.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user.id,)
+    )
+
+    exists = cur.fetchone()
+
+    if exists:
+        conn.close()
+        return False
+
+    # Self referral বন্ধ
+    if referred_by == user.id:
+        referred_by = None
+
+    # Referrer সত্যিই আছে কি না
+    valid_referrer = False
+
+    if referred_by:
+        cur.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (referred_by,)
+        )
+
+        if cur.fetchone():
+            valid_referrer = True
+        else:
             referred_by = None
 
-    add_user(user, referred_by)
+    # নতুন User-এর Bonus
+    initial_balance = NEW_USER_BONUS if valid_referrer else 0
+
+    # নতুন User তৈরি
+    cur.execute("""
+        INSERT INTO users
+        (user_id, username, first_name, balance, referred_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        initial_balance,
+        referred_by,
+        datetime.now().isoformat()
+    ))
+
+    # Referrer Bonus
+    if valid_referrer:
+        cur.execute("""
+            UPDATE users
+            SET balance = balance + ?
+            WHERE user_id = ?
+        """, (
+            REFERRER_BONUS,
+            referred_by
+        ))
+
+    conn.commit()
+    conn.close()
+
+    return True
+
+    new_user = add_user(user, referred_by)
 
     keyboard = [
         [
